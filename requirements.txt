@@ -1,0 +1,16 @@
+# school-reel-maker の依存ライブラリ一覧
+# インストール方法: pip install -r requirements.txt
+
+# 動画の読み込み・編集・書き出しに使うライブラリ
+# MoviePy は内部で ffmpeg を使って動画を処理します
+moviepy==1.0.3
+
+# 音量計算など数値処理に使うライブラリ
+numpy>=1.21.0
+
+# MoviePy が内部で使う画像 I/O ライブラリ
+imageio>=2.9.0
+
+# ffmpeg のバイナリを Python パッケージとして同梱するライブラリ
+# これにより、ffmpeg を別途インストールしなくても動く場合があります
+imageio-ffmpeg>=0.4.7

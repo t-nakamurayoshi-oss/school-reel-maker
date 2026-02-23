@@ -1,0 +1,23 @@
+# 素材動画と生成された動画は Git で管理しない（ファイルが大きいため）
+input/*
+!input/.gitkeep
+
+output/*
+!output/.gitkeep
+
+# Python のキャッシュファイル
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 仮想環境フォルダ
+venv/
+.venv/
+env/
+
+# macOS のメタデータ
+.DS_Store
+
+# エディタの設定ファイル
+.vscode/
+.idea/
