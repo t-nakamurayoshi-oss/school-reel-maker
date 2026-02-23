@@ -14,3 +14,7 @@ imageio>=2.9.0
 # ffmpeg のバイナリを Python パッケージとして同梱するライブラリ
 # これにより、ffmpeg を別途インストールしなくても動く場合があります
 imageio-ffmpeg>=0.4.7
+
+# YAML ファイルの読み込みに使うライブラリ
+# presets/variants.yaml を読み込む make_reel_ab.py で必要
+pyyaml>=6.0
