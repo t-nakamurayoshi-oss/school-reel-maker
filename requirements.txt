@@ -18,3 +18,21 @@ imageio-ffmpeg>=0.4.7
 # YAML ファイルの読み込みに使うライブラリ
 # presets/variants.yaml を読み込む make_reel_ab.py で必要
 pyyaml>=6.0
+
+# ============================================================
+# オプション: スコアリングエンジン用ライブラリ
+# 以下はインストールしなくても make_reel.py / make_reel_ab.py は動きます。
+# 高度なスコアリングを使う場合にインストールしてください。
+# ============================================================
+
+# 顔検出・笑顔検出・人物中心クロップに使うライブラリ
+# インストールすると score_engine.py の笑顔スコア・顔サイズスコアが有効になる
+# headless 版は GUI 不要でサーバー・CLI 環境向け（推奨）
+# インストール: pip install opencv-python-headless
+# opencv-python-headless>=4.5.0
+
+# 音声文字起こし（文脈スコア）に使うライブラリ
+# インストール後、presets/variants.yaml の use_whisper: true に変更して使う
+# 初回実行時にモデルファイル(39MB〜)がダウンロードされます
+# インストール: pip install openai-whisper
+# openai-whisper

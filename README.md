@@ -367,6 +367,104 @@ variants:
 
 ---
 
+---
+
+## 重みを調整して編集方針を変える方法
+
+`presets/variants.yaml` の `weights` セクションを編集することで、
+カット選定の優先基準をバリアントごとに変えられます。
+
+### スコアの種類と意味
+
+| スコア名 | キー | 内容 | 必要なライブラリ |
+|---------|------|------|----------------|
+| 音量スコア | `w_audio` | 歓声・拍手など音量の大きさ | なし |
+| 動きスコア | `w_motion` | フレーム間の動きの激しさ | なし |
+| 笑顔スコア | `w_smile` | 笑顔が映っているフレームの割合 | OpenCV |
+| 顔サイズスコア | `w_face_size` | 顔が画面内で大きく映る度合い | OpenCV |
+| 文脈スコア | `w_context` | ポジティブワードの含有率 | Whisper |
+
+### 総合スコアの計算式
+
+```
+total_score =
+    w_audio     × 音量スコア(正規化済み)
+  + w_smile     × 笑顔スコア(正規化済み)
+  + w_face_size × 顔サイズスコア(正規化済み)
+  + w_motion    × 動きスコア(正規化済み)
+  + w_context   × 文脈スコア(正規化済み)
+```
+
+> 各スコアは全セグメントにわたって 0〜1 に正規化されてから重みが掛かります。
+> そのため、異なるスケール（音量 0.01 と動きスコア 20）が公平に比較されます。
+
+### 設定例
+
+```yaml
+# 笑顔重視: 笑顔が多く映るシーンを優先
+weights:
+  w_audio:     0.1
+  w_smile:     0.5   ← 笑顔スコアを最大に
+  w_face_size: 0.2
+  w_motion:    0.1
+  w_context:   0.1
+
+# 音量重視: 歓声・盛り上がりを優先
+weights:
+  w_audio:     0.6   ← 音量スコアを最大に
+  w_smile:     0.1
+  w_face_size: 0.1
+  w_motion:    0.2
+  w_context:   0.0
+
+# 動き重視: 激しい動作シーンを優先
+weights:
+  w_audio:     0.2
+  w_smile:     0.1
+  w_face_size: 0.1
+  w_motion:    0.6   ← 動きスコアを最大に
+  w_context:   0.0
+```
+
+### OpenCV のインストール（笑顔・顔サイズスコアを有効にする）
+
+```bash
+pip install opencv-python-headless
+```
+
+インストール後は `w_smile` や `w_face_size` の重みを上げると効果が出ます。
+OpenCV がない場合、これらのスコアは自動的に 0.0 として扱われます。
+
+### Whisper のインストール（文脈スコアを有効にする）
+
+```bash
+pip install openai-whisper
+```
+
+インストール後、`presets/variants.yaml` の以下の設定を変更します:
+
+```yaml
+config:
+  use_whisper: true        # false → true に変更
+  whisper_model: "tiny"   # tiny / base / small / medium から選択
+```
+
+> Whisper を有効にすると各セグメントの文字起こしを行うため、
+> 処理時間が大幅に増加します（3秒クリップ 1 本あたり数秒〜十数秒）。
+
+### 将来の拡張について
+
+`score_engine.py` は拡張を想定した設計になっています:
+
+- **新しいスコアを追加する**: `score_engine.py` に関数を追加し、
+  `compute_all_scores()` に組み込む
+- **重みの自動最適化**: `experiments/review.csv` の蓄積データから
+  `recommend_next.py` に機械学習ロジックを追加する
+- **MediaPipe 対応**: `get_smile_score()` / `get_face_size_score()` の
+  内部実装を Haar Cascade から MediaPipe に差し替える（高精度化）
+
+---
+
 ## トラブルシューティング
 
 **`No module named 'moviepy'` エラー:**

@@ -5,174 +5,120 @@ make_reel_ab.py
 
 ABテスト用に複数バリアントのリール動画を自動生成するスクリプト。
 
-presets/variants.yaml に定義されたパラメータで複数のリールを生成し、
-output/candidates/ に保存します。
-
 【使い方】
     1. input/ フォルダに動画ファイルを入れる
-    2. presets/variants.yaml でバリアントを設定する（デフォルトでA/B/Cの3本）
+    2. presets/variants.yaml でバリアントを設定する
     3. python make_reel_ab.py を実行する
     4. output/candidates/reel_A.mp4, reel_B.mp4, ... が生成される
-    5. 各動画の生成条件が output/manifests/reel_A.json などに保存される
-    6. 3本を投稿して results を experiments/review.csv に記入する
-    7. python recommend_next.py で次回おすすめ設定を確認する
+    5. experiments/review.csv に投稿後の数値を記入する
+    6. python recommend_next.py で次回おすすめ設定を確認する
 
-【make_reel.py との違い】
-    - 1本ではなく複数のバリアントを一括生成
-    - 音量スコアに加えて「動きスコア」も計算
-    - 冒頭のフックシーンをバリアントごとに異なる方法で選択
-    - 生成条件をマニフェスト (JSON) に記録して再現・比較を可能にする
+【make_reel.py との主な違い】
+    - 複数バリアントを一括生成
+    - 音量・動き・笑顔・顔サイズ・文脈の 5 種類のスコアを計算
+    - variants.yaml の weights でバリアントごとに重みを変えてカット選定
+    - 顔検出で人物が画面中央に来るようにクロップ（OpenCV が必要）
+    - 生成条件を JSON マニフェストに記録
 """
 
-import os           # ファイルパスの操作に使う
-import sys          # スクリプト終了 (sys.exit) に使う
-import glob         # ワイルドカードでファイルを検索する
-import json         # マニフェストを JSON 形式で保存する
-import datetime     # 生成日時の記録に使う
+import os
+import sys
+import glob
+import json
+import datetime
 
-import numpy as np          # 数値計算（音量・動きスコア）に使う
-import yaml                 # variants.yaml を読み込む (pip install pyyaml)
+import numpy as np
+import yaml
 from moviepy.editor import (
-    VideoFileClip,          # 動画ファイルを読み込むクラス
-    concatenate_videoclips, # 複数クリップをつなぐ関数
-    AudioFileClip,          # BGM ファイルを読み込むクラス
+    VideoFileClip,
+    concatenate_videoclips,
+    AudioFileClip,
 )
 
-# make_reel.py から共通のユーティリティ関数を import する
-# （コードの重複を避けるため、基本機能は make_reel.py に集約している）
+# ── make_reel.py から共通ユーティリティを import ──
 from make_reel import (
-    get_audio_rms,      # 音量 (RMS) を計算する関数
-    crop_to_vertical,   # 縦型 (9:16) にクロップする関数
-    VIDEO_EXTENSIONS,   # 対応する動画拡張子のリスト
-    MIN_CLIP_DURATION,  # 最小クリップ長（秒）
-    OUTPUT_WIDTH,       # 出力幅 (1080)
-    OUTPUT_HEIGHT,      # 出力高さ (1920)
-    OUTPUT_FPS,         # 出力フレームレート (30)
+    crop_to_vertical,   # 中央クロップ版（OpenCV なし環境でのフォールバック）
+    VIDEO_EXTENSIONS,
+    MIN_CLIP_DURATION,
+    OUTPUT_WIDTH,
+    OUTPUT_HEIGHT,
+    OUTPUT_FPS,
+)
+
+# ── score_engine から全スコア計算・正規化・合算関数を import ──
+from score_engine import (
+    OPENCV_AVAILABLE,
+    WHISPER_AVAILABLE,
+    load_whisper_model,
+    compute_all_scores,
+    normalize_all_scores,
+    compute_total_score,
+    crop_to_vertical_face,
+    DEFAULT_WEIGHTS,
 )
 
 # ============================================================
 # パス設定
-# ここを変えると入出力先を変更できます
 # ============================================================
 
-INPUT_DIR       = "input"                               # 素材動画フォルダ
-VARIANTS_FILE   = os.path.join("presets", "variants.yaml")  # バリアント設定
-CANDIDATES_DIR  = os.path.join("output", "candidates") # リール出力先
-MANIFESTS_DIR   = os.path.join("output", "manifests")  # マニフェスト出力先
-EXPERIMENTS_DIR = "experiments"                         # 実験データフォルダ
-REVIEW_CSV      = os.path.join(EXPERIMENTS_DIR, "review.csv")  # レビューシート
+INPUT_DIR       = "input"
+VARIANTS_FILE   = os.path.join("presets", "variants.yaml")
+CANDIDATES_DIR  = os.path.join("output", "candidates")
+MANIFESTS_DIR   = os.path.join("output", "manifests")
+EXPERIMENTS_DIR = "experiments"
+REVIEW_CSV      = os.path.join(EXPERIMENTS_DIR, "review.csv")
+
 
 # ============================================================
 # variants.yaml 読み込み
 # ============================================================
 
-def load_variants():
+def load_config_and_variants():
     """
-    presets/variants.yaml を読み込んでバリアントのリストを返す関数。
-
-    variants.yaml の例:
-        variants:
-          - name: "A"
-            hook_mode: "loud"
-            clip_sec: 3
-            ...
+    presets/variants.yaml を読み込み、グローバル設定とバリアントリストを返す関数。
 
     戻り値:
-        list[dict]: バリアント設定の辞書リスト
+        (dict, list[dict]): (config設定辞書, バリアント設定のリスト)
     """
     if not os.path.exists(VARIANTS_FILE):
         print(f"[エラー] {VARIANTS_FILE} が見つかりません。")
-        print(f"         presets/variants.yaml を確認してください。")
         sys.exit(1)
 
     with open(VARIANTS_FILE, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
+    config   = data.get("config", {})
     variants = data.get("variants", [])
+
     if not variants:
         print("[エラー] variants.yaml にバリアントが定義されていません。")
         sys.exit(1)
 
-    return variants
+    return config, variants
 
 
 # ============================================================
-# 動画分析: 音量スコア + 動きスコア
+# 動画分析（全スコアを計算）
 # ============================================================
 
-def get_motion_score(clip):
+def analyze_all_videos(video_files, clip_sec, whisper_model=None):
     """
-    動画クリップの「動きの大きさ」を数値化する関数。
+    全動画ファイルを分析し、各セグメントの 5 種類のスコアを計算する関数。
 
-    フレーム間のピクセル差分を計算することで、シーンにどれだけ
-    動きがあるかを判定します。
-
-    【原理】
-        - 連続する2枚のフレームを引き算する
-        - 差が大きい = ピクセルが多く変化した = 動きが大きい
-
-    例:
-        - 静止している黒板 → スコア低（変化が少ない）
-        - 運動会のリレー   → スコア高（走る動きで多くのピクセルが変化）
-
-    引数:
-        clip: MoviePy のクリップオブジェクト
-
-    戻り値:
-        float: 動きスコア（大きいほど動きが激しい）
-    """
-    try:
-        duration = clip.duration
-
-        # クリップの 25%・50%・75% の時点のフレームをサンプリングする
-        # （全フレームを取得すると処理が重いため、3点に絞る）
-        sample_times = [duration * 0.25, duration * 0.5, duration * 0.75]
-
-        # 各時刻のフレームを NumPy 配列として取得してグレースケールに変換
-        # get_frame(t) は (高さ, 幅, 3チャンネル) の配列を返す
-        frames = []
-        for t in sample_times:
-            t = min(t, duration - 0.01)  # 動画末尾を超えないように補正
-            frame_rgb = clip.get_frame(t)
-            # R, G, B の平均を取ってグレースケール（1チャンネル）にする
-            # こうすると計算量が 1/3 になる
-            frame_gray = frame_rgb.mean(axis=2)
-            frames.append(frame_gray.astype(float))
-
-        # 連続するフレーム間の平均絶対差分を計算
-        diffs = []
-        for i in range(1, len(frames)):
-            diff = np.abs(frames[i] - frames[i - 1])
-            diffs.append(diff.mean())
-
-        return float(np.mean(diffs)) if diffs else 0.0
-
-    except Exception as e:
-        # フレーム取得に失敗した場合（破損ファイルなど）
-        print(f"    [警告] 動きスコアの計算に失敗: {e}")
-        return 0.0
-
-
-def analyze_all_videos(video_files, clip_sec):
-    """
-    全動画ファイルを分析し、全セグメントのスコア情報を返す関数。
-
-    各セグメントについて以下を計算します:
-        - 音量スコア (rms): 大きいほど盛り上がっている
-        - 動きスコア (motion): 大きいほど活発なシーン
+    【スコア計算の流れ】
+        1. 動画を clip_sec 秒ごとに分割
+        2. 各セグメントで compute_all_scores() を呼び、5スコアを取得
+        3. 全セグメントを返す（正規化はこの後で一括処理）
 
     引数:
         video_files (list[str]): 動画ファイルのパスリスト
         clip_sec (float)       : 1セグメントの長さ（秒）
+        whisper_model          : Whisper モデル（None でコンテキストスコアをスキップ）
 
     戻り値:
-        list[dict]: 全セグメントの情報リスト。各要素:
-            - path    : 動画ファイルのパス
-            - start   : 開始時間（秒）
-            - end     : 終了時間（秒）
-            - duration: 長さ（秒）
-            - rms     : 音量スコア
-            - motion  : 動きスコア
+        list[dict]: セグメント情報のリスト。各要素:
+            - path, start, end, duration : 動画・時間情報
+            - scores (dict)              : 5種類の生スコア
     """
     all_segments = []
 
@@ -180,7 +126,7 @@ def analyze_all_videos(video_files, clip_sec):
         print(f"\n  分析中: {os.path.basename(video_path)}")
 
         try:
-            video = VideoFileClip(video_path)
+            video    = VideoFileClip(video_path)
             duration = video.duration
 
             print(f"    長さ: {duration:.1f}秒 / 解像度: {video.w}×{video.h}")
@@ -195,26 +141,22 @@ def analyze_all_videos(video_files, clip_sec):
 
             while start_time < duration - MIN_CLIP_DURATION:
                 end_time = min(start_time + clip_sec, duration)
-                seg_dur = end_time - start_time
+                seg_dur  = end_time - start_time
 
                 if seg_dur < MIN_CLIP_DURATION:
                     break
 
-                # 区間を切り出す
                 seg_clip = video.subclip(start_time, end_time)
 
-                # 音量スコアを計算
-                rms = get_audio_rms(seg_clip)
-                # 動きスコアを計算
-                motion = get_motion_score(seg_clip)
+                # 5種類のスコアを一括計算
+                scores = compute_all_scores(seg_clip, whisper_model)
 
                 all_segments.append({
                     "path":     video_path,
                     "start":    start_time,
                     "end":      end_time,
                     "duration": seg_dur,
-                    "rms":      rms,
-                    "motion":   motion,
+                    "scores":   scores,  # {"audio": ..., "motion": ..., ...}
                 })
 
                 seg_clip.close()
@@ -237,18 +179,16 @@ def analyze_all_videos(video_files, clip_sec):
 
 def select_hook_segment(segments, hook_mode):
     """
-    バリアントの hook_mode に応じて冒頭シーンを1つ選ぶ関数。
-
-    フック（hook）とは動画の最初の数秒で視聴者を引き込むシーンのこと。
-    Instagram では最初の数秒が「続きを見るかどうか」の判断に直結します。
+    バリアントの hook_mode に応じて冒頭シーンを 1 つ選ぶ関数。
 
     hook_mode の意味:
-        loud   → 歓声・盛り上がりを冒頭に → 音量が最大のセグメントを選択
-        motion → 激しい動きを冒頭に      → 動きスコアが最大のセグメントを選択
-        face   → 顔が大きく映るシーンを冒頭に → 将来実装予定（現在は loud にフォールバック）
+        loud      → 音量が最大のシーン（歓声・拍手を冒頭に）
+        motion    → 動きが最大のシーン（激しい動作を冒頭に）
+        face      → 顔サイズスコアが最大のシーン（クローズアップを冒頭に）[要 OpenCV]
+        smile     → 笑顔スコアが最大のシーン（笑顔を冒頭に）              [要 OpenCV]
 
     引数:
-        segments (list[dict]): 全セグメントのリスト
+        segments (list[dict]): 全セグメントのリスト（"scores" キーが必要）
         hook_mode (str)      : フックの選び方
 
     戻り値:
@@ -258,75 +198,84 @@ def select_hook_segment(segments, hook_mode):
         return None
 
     if hook_mode == "loud":
-        # 音量（RMS）が最大のセグメントを選ぶ
-        return max(segments, key=lambda s: s["rms"])
+        return max(segments, key=lambda s: s["scores"]["audio"])
 
     elif hook_mode == "motion":
-        # 動きスコアが最大のセグメントを選ぶ
-        return max(segments, key=lambda s: s["motion"])
+        return max(segments, key=lambda s: s["scores"]["motion"])
 
     elif hook_mode == "face":
-        # 顔検出は将来の拡張として設計。
-        # 実装するには OpenCV の Haar Cascade や MediaPipe を使う。
-        # TODO: 顔サイズ・位置スコアを計算してここで返す
-        print("    [情報] face モードは未実装のため、loud にフォールバックします。")
-        return max(segments, key=lambda s: s["rms"])
+        if not OPENCV_AVAILABLE:
+            print("    [情報] face モード: OpenCV がないため loud にフォールバック")
+            return max(segments, key=lambda s: s["scores"]["audio"])
+        return max(segments, key=lambda s: s["scores"]["face_size"])
+
+    elif hook_mode == "smile":
+        if not OPENCV_AVAILABLE:
+            print("    [情報] smile モード: OpenCV がないため loud にフォールバック")
+            return max(segments, key=lambda s: s["scores"]["audio"])
+        return max(segments, key=lambda s: s["scores"]["smile"])
 
     else:
         print(f"    [警告] 未知の hook_mode: '{hook_mode}'。loud にフォールバックします。")
-        return max(segments, key=lambda s: s["rms"])
+        return max(segments, key=lambda s: s["scores"]["audio"])
 
 
 # ============================================================
 # セグメント選択（フック + 本編）
 # ============================================================
 
-def select_segments_for_variant(all_segments, hook_segment, target_sec):
+def select_segments_for_variant(all_segments, hook_segment, target_sec, weights):
     """
-    フックセグメントを先頭に配置し、残りを音量スコア順で埋める関数。
+    フックセグメントを先頭に配置し、残りを総合スコア順で埋める関数。
 
-    【組み立て方】
-        1. フックセグメント（hook_mode で選んだ最良のシーン）を先頭に
-        2. 残りの時間を音量の大きい順に補充する
-        3. 合計が target_sec 以上になったら終了
+    【選び方】
+        1. フックセグメント（hook_mode で選んだシーン）を先頭に固定
+        2. 残りを「総合スコア（重み付き）」の高い順に追加
+        3. 合計時間が target_sec に達したら終了
 
     引数:
-        all_segments (list[dict]): 全セグメントのリスト
+        all_segments (list[dict]): 全セグメント（"norm_scores" キーが必要）
         hook_segment (dict)      : 冒頭に配置するセグメント
         target_sec (float)       : 目標の合計時間（秒）
+        weights (dict)           : 各スコアの重み（variants.yaml の weights）
 
     戻り値:
         (list[dict], float): 選ばれたセグメントリストと合計時間のタプル
     """
-    selected = []
+    selected  = []
     total_sec = 0.0
 
     # ── 1. フックセグメントを先頭に追加 ──
     if hook_segment:
         hook_copy = dict(hook_segment)
-        hook_copy["role"] = "hook"  # フックであることをマーキング
+        hook_copy["role"] = "hook"
         selected.append(hook_copy)
         total_sec += hook_segment["duration"]
 
-    # ── 2. 残りを音量の大きい順に追加 ──
-    # 音量順に並べたコピーを作成（元のリストは変えない）
-    body_candidates = sorted(all_segments, key=lambda s: s["rms"], reverse=True)
+    # ── 2. 各セグメントの総合スコアを計算して降順ソート ──
+    # ここでバリアントごとに異なる重みが適用される（ABテストの核心部分）
+    scored = sorted(
+        all_segments,
+        key=lambda s: compute_total_score(s.get("norm_scores", {}), weights),
+        reverse=True,
+    )
 
-    for seg in body_candidates:
+    # ── 3. フック以外のセグメントを総合スコア順に追加 ──
+    for seg in scored:
         if total_sec >= target_sec:
             break
 
-        # フックセグメントと同じ区間は二重に入れない
-        is_same_as_hook = (
+        # フックと同じ区間は重複して追加しない
+        is_hook = (
             hook_segment is not None
-            and seg["path"] == hook_segment["path"]
+            and seg["path"]  == hook_segment["path"]
             and seg["start"] == hook_segment["start"]
         )
-        if is_same_as_hook:
+        if is_hook:
             continue
 
         seg_copy = dict(seg)
-        seg_copy["role"] = "body"  # 本編部分をマーキング
+        seg_copy["role"] = "body"
         selected.append(seg_copy)
         total_sec += seg["duration"]
 
@@ -334,83 +283,90 @@ def select_segments_for_variant(all_segments, hook_segment, target_sec):
 
 
 # ============================================================
-# 動画書き出し（BGM オプション付き）
+# 動画書き出し（顔中心クロップ + BGM オプション付き）
 # ============================================================
 
 def build_and_export(selected_segments, output_path, crossfade_sec, bgm_path=None):
     """
     選択されたセグメントをつなぎ合わせて動画ファイルに書き出す関数。
 
+    【クロップの動作】
+        OpenCV がインストールされている場合:
+            → crop_to_vertical_face() を使い、顔の中心にクロップ（人物中心クロップ）
+        OpenCV がない場合:
+            → crop_to_vertical() を使い、フレームの幾何学的中央にクロップ
+
     引数:
-        selected_segments (list[dict]): 使用するセグメントのリスト（先頭がフック）
-        output_path (str)             : 出力ファイルのパス（例: output/candidates/reel_A.mp4）
+        selected_segments (list[dict]): 使用するセグメントリスト（先頭がフック）
+        output_path (str)             : 出力ファイルのパス
         crossfade_sec (float)         : クロスフェードの長さ（秒）
-        bgm_path (str or None)        : BGM ファイルのパス。None の場合は元音声のまま。
+        bgm_path (str or None)        : BGM ファイルのパス（None = なし）
     """
-    open_videos = []  # 後でクローズするために追跡するリスト
+    open_videos = []
     clips = []
 
     for i, seg in enumerate(selected_segments):
         role_tag = "★フック" if seg.get("role") == "hook" else f" 本編{i:02d}"
-        fname = os.path.basename(seg["path"])
-        print(f"  [{role_tag}] {fname}  {seg['start']:.1f}s〜{seg['end']:.1f}s")
+        # スコア情報も表示してどんなシーンか分かるようにする
+        s = seg.get("scores", {})
+        score_str = (
+            f"audio={s.get('audio', 0):.3f} "
+            f"motion={s.get('motion', 0):.1f} "
+            f"smile={s.get('smile', 0):.2f}"
+        )
+        print(f"  [{role_tag}] {os.path.basename(seg['path'])}"
+              f"  {seg['start']:.1f}s〜{seg['end']:.1f}s  ({score_str})")
 
-        # 動画を開いて区間を切り出す
         video = VideoFileClip(seg["path"])
         open_videos.append(video)
-        clip = video.subclip(seg["start"], seg["end"])
-        clip_v = crop_to_vertical(clip)
+        clip  = video.subclip(seg["start"], seg["end"])
+
+        # ── クロップ: OpenCV があれば顔中心、なければフレーム中央 ──
+        if OPENCV_AVAILABLE:
+            clip_v = crop_to_vertical_face(clip, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+        else:
+            clip_v = crop_to_vertical(clip)
+
         clips.append(clip_v)
 
     if not clips:
-        print("  [エラー] 有効なクリップがありません。このバリアントをスキップします。")
+        print("  [エラー] クリップが空です。このバリアントをスキップします。")
         return
 
-    # ── クリップを結合（クロスフェードあり or ブツ切り）──
+    # ── クリップを結合 ──
     if len(clips) > 1 and crossfade_sec > 0:
-        # 2枚目以降に crossfadein を適用してなめらかにつなぐ
-        faded_clips = [clips[0]]
+        faded = [clips[0]]
         for c in clips[1:]:
-            faded_clips.append(c.crossfadein(crossfade_sec))
-        final = concatenate_videoclips(
-            faded_clips, padding=-crossfade_sec, method="compose"
-        )
+            faded.append(c.crossfadein(crossfade_sec))
+        final = concatenate_videoclips(faded, padding=-crossfade_sec, method="compose")
     else:
         final = concatenate_videoclips(clips, method="compose")
 
-    # ── BGM を追加（bgm_path が指定されている場合）──
+    # ── BGM を追加（オプション）──
     if bgm_path:
         if os.path.exists(bgm_path):
             print(f"  BGM を追加中: {bgm_path}")
             try:
                 from moviepy.editor import CompositeAudioClip
+                from moviepy.audio.fx.all import audio_loop
 
                 bgm = AudioFileClip(bgm_path)
-                # 動画の長さに合わせて BGM をループまたはトリム
+                # 動画の長さに BGM を合わせる（短い場合はループ）
                 if bgm.duration < final.duration:
-                    # BGM が短い場合: ループ再生（単純に繰り返す）
-                    repeat_count = int(final.duration / bgm.duration) + 1
-                    from moviepy.audio.fx.all import audio_loop
-                    bgm = audio_loop(bgm, nloops=repeat_count)
-                bgm = bgm.subclip(0, final.duration)
-
-                # BGM を 30% に下げて元音声と合成（元音声の方が聞こえるように）
-                bgm = bgm.volumex(0.3)
+                    repeat = int(final.duration / bgm.duration) + 1
+                    bgm = audio_loop(bgm, nloops=repeat)
+                bgm = bgm.subclip(0, final.duration).volumex(0.3)  # 音量 30%
                 if final.audio is not None:
-                    mixed_audio = CompositeAudioClip([final.audio, bgm])
+                    final = final.set_audio(CompositeAudioClip([final.audio, bgm]))
                 else:
-                    mixed_audio = bgm
-                final = final.set_audio(mixed_audio)
-
+                    final = final.set_audio(bgm)
             except Exception as e:
-                print(f"  [警告] BGM の追加に失敗しました: {e}")
+                print(f"  [警告] BGM の追加に失敗: {e}")
         else:
             print(f"  [警告] BGM ファイルが見つかりません: {bgm_path}")
 
-    # ── 動画ファイルとして書き出す ──
+    # ── 書き出し ──
     print(f"\n  書き出し中: {output_path}")
-    print("  (処理に数分かかる場合があります...)\n")
-
     final.write_videofile(
         output_path,
         fps=OUTPUT_FPS,
@@ -421,7 +377,7 @@ def build_and_export(selected_segments, output_path, crossfade_sec, bgm_path=Non
         logger="bar",
     )
 
-    # ── 後処理: 開いたオブジェクトを全てクローズ ──
+    # ── 後処理 ──
     final.close()
     for v in open_videos:
         try:
@@ -436,55 +392,45 @@ def build_and_export(selected_segments, output_path, crossfade_sec, bgm_path=Non
 
 def save_manifest(variant, selected_segments, total_sec, manifest_path):
     """
-    バリアントの生成条件をJSONファイルに保存する関数。
-
-    マニフェストとは「この動画はどんな設定で作られたか」の記録です。
-    experiments/review.csv と組み合わせることで、
-    「どの設定が良かったか」を後から分析できます。
+    バリアントの生成条件を JSON ファイルに保存する関数。
 
     保存される内容:
-        - バリアント名・説明ラベル
-        - 生成日時
-        - パラメータ（hook_mode, clip_sec, target_sec, ...）
-        - 使用したクリップ一覧（ファイル名・開始終了時間・スコア）
+        - バリアント名・ラベル・生成日時
+        - パラメータ（hook_mode, clip_sec, weights など）
+        - 使用したクリップ一覧（ファイル名・時刻・全スコア）
         - 合計時間
-
-    引数:
-        variant (dict)               : variants.yaml のバリアント設定
-        selected_segments (list[dict]): 使用したセグメントのリスト
-        total_sec (float)            : 合計時間（秒）
-        manifest_path (str)          : 保存先のパス
     """
     manifest = {
-        # ── 基本情報 ──
         "variant":      variant["name"],
         "label":        variant.get("label", ""),
         "generated_at": datetime.datetime.now().isoformat(),
-
-        # ── 生成パラメータ（variants.yaml の設定をそのまま記録）──
         "params": {
             "hook_mode":     variant.get("hook_mode", "loud"),
             "clip_sec":      variant.get("clip_sec", 3),
             "target_sec":    variant.get("target_sec", 60),
             "bgm":           variant.get("bgm", None),
             "crossfade_sec": variant.get("crossfade_sec", 0.3),
+            # weights も保存して「どの重みで作ったか」を記録
+            "weights":       variant.get("weights", DEFAULT_WEIGHTS),
         },
-
-        # ── 使用したクリップの一覧 ──
-        # これを見ると「どの動画の何秒のシーンを使ったか」が分かる
         "clips": [
             {
-                "role":      seg.get("role", "body"),        # hook / body
-                "source":    os.path.basename(seg["path"]),  # ファイル名
+                "role":      seg.get("role", "body"),
+                "source":    os.path.basename(seg["path"]),
                 "start_sec": round(seg["start"], 2),
                 "end_sec":   round(seg["end"], 2),
-                "rms":       round(seg["rms"], 4),           # 音量スコア
-                "motion":    round(seg.get("motion", 0.0), 4),  # 動きスコア
+                # 全スコアを記録（あとで分析できるように）
+                "scores": {
+                    k: round(v, 4)
+                    for k, v in seg.get("scores", {}).items()
+                },
+                "norm_scores": {
+                    k: round(v, 4)
+                    for k, v in seg.get("norm_scores", {}).items()
+                },
             }
             for seg in selected_segments
         ],
-
-        # ── 合計時間 ──
         "total_duration_sec": round(total_sec, 2),
     }
 
@@ -501,35 +447,17 @@ def save_manifest(variant, selected_segments, total_sec, manifest_path):
 def init_review_csv(variants):
     """
     experiments/review.csv を初期化する関数。
-
-    ファイルが存在しない場合にだけヘッダーとサンプル行を書き込みます。
-    すでに存在する場合は何もしません（既存データを消さない）。
-
-    CSV の列:
-        date         : 投稿日（YYYY-MM-DD）
-        variant      : バリアント名（A, B, C, ...）
-        filename     : ファイル名（reel_A.mp4）
-        views        : 再生数
-        saves        : 保存数（最重要指標）
-        avg_watch_sec: 平均視聴時間（秒）
-        notes        : メモ（投稿タイミング・キャプションなど）
-
-    引数:
-        variants (list[dict]): バリアントのリスト（ファイル名生成に使用）
+    ファイルが存在しない場合にのみ作成します（既存データは保護）。
     """
     os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
 
     if not os.path.exists(REVIEW_CSV):
         with open(REVIEW_CSV, "w", encoding="utf-8") as f:
-            # ヘッダー行
             f.write("date,variant,filename,views,saves,avg_watch_sec,notes\n")
-            # 各バリアントのサンプル行（まだ投稿していない状態）
             for v in variants:
                 name = v["name"]
                 f.write(f"YYYY-MM-DD,{name},reel_{name}.mp4,0,0,0.0,投稿前\n")
-
         print(f"\n[✓] レビューシートを作成しました: {REVIEW_CSV}")
-        print("    投稿後にこのCSVファイルに結果を記入してください。")
     else:
         print(f"\n[✓] レビューシートは既に存在します: {REVIEW_CSV}")
 
@@ -543,29 +471,27 @@ def make_reel_ab():
     ABテスト用リール生成のメイン処理。
 
     処理の流れ:
-        [準備]      フォルダの確認・作成
-        [収集]      input/ から動画ファイルを収集
-        [設定読込]  presets/variants.yaml を読み込む
-        [分析]      全動画を分析（音量・動きスコア）
-        [生成]      各バリアントでリールを生成・書き出し
-        [記録]      マニフェスト (JSON) を保存
-        [後処理]    experiments/review.csv を初期化
+        [準備]    フォルダ確認・動画収集・variants.yaml 読み込み
+        [設定]    Whisper ロード（use_whisper: true の場合）
+        [分析]    全動画を分析（5種類のスコアを計算）
+        [正規化]  全セグメントのスコアを 0〜1 に正規化
+        [生成]    各バリアントでリールを生成・書き出し
+        [記録]    マニフェスト JSON + review.csv を保存
     """
     print("=" * 60)
-    print("  学校行事リールメーカー ABテスト版")
+    print("  学校行事リールメーカー ABテスト版 (スコアリングエンジン搭載)")
     print("=" * 60)
 
-    # ── フォルダを確認・作成 ──
+    # ── フォルダ確認 ──
     for d in [CANDIDATES_DIR, MANIFESTS_DIR, EXPERIMENTS_DIR]:
         os.makedirs(d, exist_ok=True)
 
     if not os.path.exists(INPUT_DIR):
         os.makedirs(INPUT_DIR)
-        print(f"\n[!] '{INPUT_DIR}/' フォルダを作成しました。")
-        print(f"    素材動画をここに入れてから再実行してください。")
+        print(f"\n[!] '{INPUT_DIR}/' を作成しました。素材動画を入れて再実行してください。")
         sys.exit(0)
 
-    # ── 動画ファイルを収集 ──
+    # ── 動画ファイル収集 ──
     video_files = []
     for ext in VIDEO_EXTENSIONS:
         video_files.extend(glob.glob(os.path.join(INPUT_DIR, ext)))
@@ -573,50 +499,79 @@ def make_reel_ab():
     video_files = sorted(list(set(video_files)))
 
     if not video_files:
-        print(f"\n[!] '{INPUT_DIR}/' フォルダに動画が見つかりません。")
+        print(f"\n[!] '{INPUT_DIR}/' に動画が見つかりません。")
         sys.exit(0)
 
     print(f"\n[✓] {len(video_files)} 本の素材動画を見つけました")
 
-    # ── variants.yaml を読み込む ──
-    variants = load_variants()
+    # ── variants.yaml 読み込み ──
+    config, variants = load_config_and_variants()
     print(f"[✓] {len(variants)} 個のバリアントを読み込みました:")
     for v in variants:
+        w = v.get("weights", DEFAULT_WEIGHTS)
         print(f"    [{v['name']}] {v.get('label', '')}  "
               f"hook={v.get('hook_mode','loud')}  "
               f"clip={v.get('clip_sec',3)}秒  "
               f"target={v.get('target_sec',60)}秒")
+        print(f"           weights: audio={w.get('w_audio',1.0):.1f}  "
+              f"smile={w.get('w_smile',0.0):.1f}  "
+              f"face_size={w.get('w_face_size',0.0):.1f}  "
+              f"motion={w.get('w_motion',0.0):.1f}  "
+              f"context={w.get('w_context',0.0):.1f}")
+
+    # ── スコアエンジンの状態を表示 ──
+    print(f"\n  スコアエンジンの状態:")
+    print(f"    OpenCV (笑顔・顔サイズ): {'✓ 利用可能' if OPENCV_AVAILABLE else '✗ 未インストール (pip install opencv-python-headless)'}")
+    print(f"    Whisper (文脈スコア)   : {'✓ 利用可能' if WHISPER_AVAILABLE else '✗ 未インストール (pip install openai-whisper)'}")
+
+    # ── Whisper モデルのロード（use_whisper: true の場合のみ）──
+    use_whisper      = config.get("use_whisper", False)
+    whisper_size     = config.get("whisper_model", "tiny")
+    whisper_model    = None
+
+    if use_whisper:
+        if WHISPER_AVAILABLE:
+            print(f"\n  Whisper モデルをロードします（モデルサイズ: {whisper_size}）")
+            whisper_model = load_whisper_model(whisper_size)
+        else:
+            print("\n  [警告] use_whisper: true ですが openai-whisper がインストールされていません。")
+            print("         文脈スコアは 0.0 になります。")
+    else:
+        print(f"\n  [情報] Whisper は無効です (use_whisper: false)。")
+        print(f"         有効にするには presets/variants.yaml の config セクションで")
+        print(f"         use_whisper: true に変更してください。")
 
     # ── 全動画を分析 ──
-    # バリアントごとに clip_sec が異なる場合は、最も短い clip_sec で分析する。
-    # こうすることで全バリアントに対応できる。
     min_clip_sec = min(v.get("clip_sec", 3) for v in variants)
-
     print(f"\n[分析] 全動画を分析しています (セグメント長: {min_clip_sec}秒)")
-    print("      (動画の本数・長さによっては数分かかります)")
+    if OPENCV_AVAILABLE:
+        print("       笑顔・顔サイズスコアも計算します（処理に時間がかかります）")
 
-    all_segments = analyze_all_videos(video_files, clip_sec=min_clip_sec)
+    all_segments = analyze_all_videos(video_files, clip_sec=min_clip_sec,
+                                      whisper_model=whisper_model)
 
     if not all_segments:
         print("\n[エラー] 有効なセグメントが見つかりませんでした。")
-        print("         動画ファイルが壊れていないか確認してください。")
         sys.exit(1)
 
     print(f"\n  合計 {len(all_segments)} セグメントが見つかりました")
 
-    # 参考: 音量・動きのトップ3を表示
-    top_rms    = sorted(all_segments, key=lambda s: s["rms"],    reverse=True)[:3]
-    top_motion = sorted(all_segments, key=lambda s: s["motion"], reverse=True)[:3]
+    # ── スコアを正規化（全セグメントにわたって 0〜1 に揃える）──
+    print("  スコアを正規化しています...")
+    normalize_all_scores(all_segments)
 
-    print("\n  音量トップ3:")
-    for i, s in enumerate(top_rms):
-        print(f"    {i+1}. {os.path.basename(s['path'])}  "
-              f"{s['start']:.1f}s〜{s['end']:.1f}s  RMS={s['rms']:.4f}")
-
-    print("  動きスコアトップ3:")
-    for i, s in enumerate(top_motion):
-        print(f"    {i+1}. {os.path.basename(s['path'])}  "
-              f"{s['start']:.1f}s〜{s['end']:.1f}s  motion={s['motion']:.2f}")
+    # 参考: 各スコアのトップ3を表示
+    for score_key, label in [("audio", "音量"), ("motion", "動き"),
+                               ("smile", "笑顔"), ("face_size", "顔サイズ")]:
+        top = sorted(all_segments, key=lambda s: s["scores"].get(score_key, 0),
+                     reverse=True)[:3]
+        if any(s["scores"].get(score_key, 0) > 0 for s in top):
+            print(f"\n  {label}スコアトップ3:")
+            for i, s in enumerate(top):
+                print(f"    {i+1}. {os.path.basename(s['path'])}"
+                      f"  {s['start']:.1f}s〜{s['end']:.1f}s"
+                      f"  raw={s['scores'].get(score_key,0):.4f}"
+                      f"  norm={s['norm_scores'].get(score_key,0):.3f}")
 
     # ── 各バリアントのリールを生成 ──
     print(f"\n{'='*60}")
@@ -629,26 +584,27 @@ def make_reel_ab():
         target_sec    = variant.get("target_sec", 60)
         crossfade_sec = variant.get("crossfade_sec", 0.3)
         bgm_path      = variant.get("bgm", None)
+        weights       = variant.get("weights", DEFAULT_WEIGHTS)
 
         output_path   = os.path.join(CANDIDATES_DIR, f"reel_{name}.mp4")
         manifest_path = os.path.join(MANIFESTS_DIR,  f"reel_{name}.json")
 
         print(f"\n[{idx+1}/{len(variants)}] バリアント {name}: {variant.get('label', '')}")
-        print(f"  hook_mode={hook_mode}  target={target_sec}秒  crossfade={crossfade_sec}秒")
 
-        # フックセグメントを選択（冒頭に配置するシーン）
+        # フックセグメントを選択
         hook_seg = select_hook_segment(all_segments, hook_mode)
         if hook_seg:
-            print(f"  フック候補: {os.path.basename(hook_seg['path'])}  "
-                  f"{hook_seg['start']:.1f}s〜{hook_seg['end']:.1f}s")
+            print(f"  フック: {os.path.basename(hook_seg['path'])}"
+                  f"  {hook_seg['start']:.1f}s〜{hook_seg['end']:.1f}s"
+                  f"  (hook_mode={hook_mode})")
 
-        # 本編セグメントを選択（フック + 音量順の本編）
+        # 本編セグメントを総合スコア順で選択
         selected, total = select_segments_for_variant(
-            all_segments, hook_seg, target_sec
+            all_segments, hook_seg, target_sec, weights
         )
         print(f"  → {len(selected)} シーンを選択 (合計: {total:.1f}秒)")
 
-        # 動画を組み立てて書き出す
+        # 動画を書き出す
         build_and_export(selected, output_path, crossfade_sec, bgm_path)
 
         # マニフェストを保存
@@ -656,7 +612,7 @@ def make_reel_ab():
 
         print(f"  [完了] {output_path}")
 
-    # ── review.csv を初期化（初回のみ作成）──
+    # ── review.csv を初期化 ──
     init_review_csv(variants)
 
     # ── 完了メッセージ ──
@@ -667,9 +623,8 @@ def make_reel_ab():
         print(f"    output/candidates/reel_{v['name']}.mp4")
     print(f"\n  次のステップ:")
     print(f"    1. output/candidates/ の動画を Instagram に投稿する")
-    print(f"    2. 数日後に投稿の数値を experiments/review.csv に記入する")
-    print(f"       (views, saves, avg_watch_sec の列に数値を入力)")
-    print(f"    3. python recommend_next.py で次回おすすめ設定を確認する")
+    print(f"    2. 投稿後に experiments/review.csv へ数値を記入する")
+    print(f"    3. python recommend_next.py でおすすめ設定を確認する")
     print("=" * 60)
 
 
