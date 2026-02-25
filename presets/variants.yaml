@@ -49,6 +49,17 @@ config:
 #     w_face_size : 顔サイズスコアの重み [要 OpenCV]
 #     w_motion    : 動きスコアの重み
 #     w_context   : 文脈スコアの重み [要 Whisper + use_whisper: true]
+#     w_shake     : 手ブレスコアの重み（値が高いほど安定した映像を優先）
+#                   0.0 = 無視（デフォルト）/ 0.2 = 軽視 / 0.5 = 重視
+#     w_tilt      : 傾きスコアの重み（値が高いほど水平な映像を優先） [要 OpenCV]
+#                   0.0 = 無視（デフォルト）/ 0.2 = 軽視 / 0.5 = 重視
+#
+# 【手ブレ・傾きの自動補正について】
+#   score_engine.py が自動的に「軽度」の手ブレ・傾きを補正します。
+#     手ブレ: SHAKE_STABLE_THRESHOLD (2.0px) 〜 SHAKE_SEVERE_THRESHOLD (8.0px) → 自動補正
+#     傾き  : TILT_IGNORE_DEG (0.5°) 〜 TILT_CORRECT_MAX (5.0°)            → 自動補正
+#   「重度」のブレ・傾きは補正されませんが、w_shake / w_tilt を上げることで
+#   スコアが下がり、カット選定から自然に除外されます。
 # ============================================================
 
 variants:
@@ -70,6 +81,8 @@ variants:
       w_face_size: 0.2        # 顔のサイズも考慮（クローズアップ優先）
       w_motion:    0.1        # 動きは控えめ
       w_context:   0.1        # 文脈（Whisper 無効の場合は 0 扱い）
+      w_shake:     0.0        # 手ブレスコア（0=無視）
+      w_tilt:      0.0        # 傾きスコア（0=無視）
 
   # ── バリアント B: 音量（盛り上がり）重視 ──
   # 「歓声・拍手・笑い声が大きいシーン」を優先。
@@ -87,6 +100,8 @@ variants:
       w_face_size: 0.1
       w_motion:    0.2        # 動きも少し重視
       w_context:   0.0
+      w_shake:     0.0        # 手ブレスコア（0=無視）
+      w_tilt:      0.0        # 傾きスコア（0=無視）
 
   # ── バリアント C: 動き重視（テンポ速め）──
   # 「動きが激しいシーン」を優先し、短いクリップで次々と場面転換。
@@ -104,6 +119,8 @@ variants:
       w_face_size: 0.1
       w_motion:    0.6        # 動きを最重視
       w_context:   0.0
+      w_shake:     0.0        # 手ブレスコア（0=無視）
+      w_tilt:      0.0        # 傾きスコア（0=無視）
 
   # ──────────────────────────────────────────
   # 以下はコメントアウトされたサンプルです。
@@ -124,7 +141,9 @@ variants:
   #     w_smile:     0.2
   #     w_face_size: 0.1
   #     w_motion:    0.1
-  #     w_context:   0.5  ← 文脈スコアを最重視（Whisper 必須）
+  #     w_context:   0.5  # 文脈スコアを最重視（Whisper 必須）
+  #     w_shake:     0.0
+  #     w_tilt:      0.0
 
   # バリアント E: バランス型（全スコアを均等に）
   # - name: "E"
@@ -135,8 +154,29 @@ variants:
   #   bgm: null
   #   crossfade_sec: 0.3
   #   weights:
-  #     w_audio:     0.2
+  #     w_audio:     0.15
+  #     w_smile:     0.15
+  #     w_face_size: 0.15
+  #     w_motion:    0.15
+  #     w_context:   0.15
+  #     w_shake:     0.15
+  #     w_tilt:      0.15
+
+  # バリアント F: 映像品質重視（手ブレ・傾きなしを優先）
+  # 手ブレ・傾きのない安定した映像を優先してカットを選ぶ。
+  # 式場・式典など「落ち着いた雰囲気」を伝えたい場合に向く。
+  # - name: "F"
+  #   label: "映像品質重視（安定・水平な映像優先）"
+  #   hook_mode: "face"
+  #   clip_sec: 3
+  #   target_sec: 60
+  #   bgm: null
+  #   crossfade_sec: 0.5
+  #   weights:
+  #     w_audio:     0.1
   #     w_smile:     0.2
-  #     w_face_size: 0.2
-  #     w_motion:    0.2
-  #     w_context:   0.2  ← 全て均等
+  #     w_face_size: 0.1
+  #     w_motion:    0.1
+  #     w_context:   0.0
+  #     w_shake:     0.25  # 手ブレの少ない安定した映像を優先
+  #     w_tilt:      0.25  # 傾きの少ない水平な映像を優先

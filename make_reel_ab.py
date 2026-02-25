@@ -49,11 +49,17 @@ from make_reel import (
 from score_engine import (
     OPENCV_AVAILABLE,
     WHISPER_AVAILABLE,
+    SHAKE_STABLE_THRESHOLD,
+    SHAKE_SEVERE_THRESHOLD,
+    TILT_IGNORE_DEG,
+    TILT_CORRECT_MAX,
     load_whisper_model,
     compute_all_scores,
     normalize_all_scores,
     compute_total_score,
     crop_to_vertical_face,
+    stabilize_clip,
+    correct_tilt,
     DEFAULT_WEIGHTS,
 )
 
@@ -103,11 +109,11 @@ def load_config_and_variants():
 
 def analyze_all_videos(video_files, clip_sec, whisper_model=None):
     """
-    全動画ファイルを分析し、各セグメントの 5 種類のスコアを計算する関数。
+    全動画ファイルを分析し、各セグメントの 7 種類のスコアと品質情報を計算する関数。
 
     【スコア計算の流れ】
         1. 動画を clip_sec 秒ごとに分割
-        2. 各セグメントで compute_all_scores() を呼び、5スコアを取得
+        2. 各セグメントで compute_all_scores() を呼び、スコアと品質情報を取得
         3. 全セグメントを返す（正規化はこの後で一括処理）
 
     引数:
@@ -118,7 +124,8 @@ def analyze_all_videos(video_files, clip_sec, whisper_model=None):
     戻り値:
         list[dict]: セグメント情報のリスト。各要素:
             - path, start, end, duration : 動画・時間情報
-            - scores (dict)              : 5種類の生スコア
+            - scores (dict)              : 7種類の生スコア (audio/motion/smile/face_size/context/shake/tilt)
+            - quality (dict)             : 品質情報 (shake_jitter/tilt_angle)
     """
     all_segments = []
 
@@ -148,15 +155,16 @@ def analyze_all_videos(video_files, clip_sec, whisper_model=None):
 
                 seg_clip = video.subclip(start_time, end_time)
 
-                # 5種類のスコアを一括計算
-                scores = compute_all_scores(seg_clip, whisper_model)
+                # 7種類のスコアと品質情報を一括計算
+                scores, quality = compute_all_scores(seg_clip, whisper_model)
 
                 all_segments.append({
                     "path":     video_path,
                     "start":    start_time,
                     "end":      end_time,
                     "duration": seg_dur,
-                    "scores":   scores,  # {"audio": ..., "motion": ..., ...}
+                    "scores":   scores,   # {"audio": ..., "shake": ..., ...}
+                    "quality":  quality,  # {"shake_jitter": ..., "tilt_angle": ...}
                 })
 
                 seg_clip.close()
@@ -321,6 +329,19 @@ def build_and_export(selected_segments, output_path, crossfade_sec, bgm_path=Non
         open_videos.append(video)
         clip  = video.subclip(seg["start"], seg["end"])
 
+        # ── 品質補正: 軽度の手ブレ・傾きを自動修正 ──
+        quality      = seg.get("quality", {})
+        shake_jitter = quality.get("shake_jitter", 0.0)
+        tilt_angle   = quality.get("tilt_angle",   0.0)
+
+        if SHAKE_STABLE_THRESHOLD <= shake_jitter <= SHAKE_SEVERE_THRESHOLD:
+            print(f"      手ブレ補正を適用 (jitter={shake_jitter:.1f}px)")
+            clip = stabilize_clip(clip)
+
+        if abs(tilt_angle) >= TILT_IGNORE_DEG:
+            print(f"      傾き補正を適用 (angle={tilt_angle:.1f}°)")
+            clip = correct_tilt(clip, tilt_angle)
+
         # ── クロップ: OpenCV があれば顔中心、なければフレーム中央 ──
         if OPENCV_AVAILABLE:
             clip_v = crop_to_vertical_face(clip, OUTPUT_WIDTH, OUTPUT_HEIGHT)
@@ -428,6 +449,8 @@ def save_manifest(variant, selected_segments, total_sec, manifest_path):
                     k: round(v, 4)
                     for k, v in seg.get("norm_scores", {}).items()
                 },
+                # 品質情報（手ブレ・傾き補正の判断に使った生データ）
+                "quality": seg.get("quality", {}),
             }
             for seg in selected_segments
         ],
@@ -517,7 +540,9 @@ def make_reel_ab():
               f"smile={w.get('w_smile',0.0):.1f}  "
               f"face_size={w.get('w_face_size',0.0):.1f}  "
               f"motion={w.get('w_motion',0.0):.1f}  "
-              f"context={w.get('w_context',0.0):.1f}")
+              f"context={w.get('w_context',0.0):.1f}  "
+              f"shake={w.get('w_shake',0.0):.1f}  "
+              f"tilt={w.get('w_tilt',0.0):.1f}")
 
     # ── スコアエンジンの状態を表示 ──
     print(f"\n  スコアエンジンの状態:")
