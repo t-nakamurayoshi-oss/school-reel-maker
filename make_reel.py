@@ -25,6 +25,7 @@ import glob       # ワイルドカードでファイルを検索する標準ラ
 import subprocess # ffmpeg を直接呼び出して音声を読み込むために使う
 
 import numpy as np                        # 音量計算の数値処理に使う
+from PIL import Image as PILImage         # フレーム単位のクロップ・リサイズに使う
 from moviepy.editor import (
     VideoFileClip,          # 動画ファイルを読み込むクラス
     concatenate_videoclips, # 複数のクリップをつなぐ関数
@@ -127,8 +128,13 @@ def crop_to_vertical(clip, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT):
     """
     動画クリップを縦型 (9:16) にクロップしてリサイズする関数。
 
-    横長 (16:9) の動画を縦型にするとき、左右を切り捨てて中央部分だけ残します。
-    スマホで横向き動画を縦に持ったとき、左右がはみ出るイメージです。
+    MoviePy の resize()/crop() API を使わず、fl_image でフレームごとに
+    PIL で直接クロップ＆リサイズします。これにより MoviePy のバージョン依存
+    バグ（次元の入れ替え問題）を完全に回避します。
+
+    処理手順:
+        横長動画 → 左右をカットして中央の 9:16 部分だけ残す → 1080×1920 にリサイズ
+        縦長動画 → 上下をカットして 9:16 にする → 1080×1920 にリサイズ
 
     引数:
         clip : MoviePy のクリップオブジェクト
@@ -138,33 +144,31 @@ def crop_to_vertical(clip, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT):
     戻り値:
         クロップ・リサイズ済みのクリップ
     """
-    original_w = clip.w   # 元の動画の幅
-    original_h = clip.h   # 元の動画の高さ
+    target_ratio = width / height  # 9:16 = 0.5625
 
-    # 目標の縦横比 (9:16 ≈ 0.5625)
-    target_ratio = width / height
-    # 元の動画の縦横比
-    original_ratio = original_w / original_h
+    def process_frame(frame):
+        # frame は numpy 配列 (H, W, 3)
+        h, w = frame.shape[:2]
 
-    if original_ratio > target_ratio:
-        # ── 横長動画の場合: 高さに合わせてスケール → 左右をクロップ ──
-        # resize(height=...) で高さ基準にスケールし、幅を後からクロップ
-        scaled = clip.resize(height=height)
-        return scaled.crop(
-            x_center=scaled.w / 2,
-            y_center=height / 2,
-            width=width,
-            height=height,
-        )
-    else:
-        # ── 縦長・正方形動画の場合: 幅に合わせてスケール → 上下をクロップ ──
-        scaled = clip.resize(width=width)
-        return scaled.crop(
-            x_center=width / 2,
-            y_center=scaled.h / 2,
-            width=width,
-            height=height,
-        )
+        if w / h > target_ratio:
+            # ── 横長: 左右をカットして縦長の 9:16 部分を取り出す ──
+            new_w = int(h * target_ratio)
+            x = (w - new_w) // 2
+            cropped = frame[:, x : x + new_w]
+        else:
+            # ── 縦長・正方形: 上下をカットして 9:16 にする ──
+            new_h = int(w / target_ratio)
+            y = (h - new_h) // 2
+            cropped = frame[y : y + new_h, :]
+
+        # PIL で目標解像度 (1080×1920) にリサイズ
+        # PIL.resize の引数は (width, height) の順
+        img = PILImage.fromarray(cropped.astype("uint8"))
+        img_resized = img.resize((width, height), PILImage.LANCZOS)
+        return np.array(img_resized)
+
+    # fl_image: クリップの全フレームに process_frame を適用する
+    return clip.fl_image(process_frame)
 
 
 def analyze_video(video_path):
