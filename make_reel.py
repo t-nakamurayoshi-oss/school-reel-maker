@@ -89,7 +89,12 @@ def get_audio_rms(clip):
     try:
         # 音声データを NumPy 配列として取得する
         # fps=22050 は「1 秒あたりのサンプル数」（CD 音質の半分程度）
-        audio_array = clip.audio.to_soundarray(fps=22050)
+        # nchunks に合わせてチャンクをリストに収めてから vstack する
+        fps = 22050
+        audio = clip.audio
+        tt = np.arange(0, clip.audio.duration, 1.0 / fps)
+        chunks = [audio.get_frame(t) for t in tt]
+        audio_array = np.array(chunks)
 
         # ステレオ（左右 2 チャンネル）の場合は平均を取ってモノラルにする
         if audio_array.ndim == 2:
@@ -129,28 +134,24 @@ def crop_to_vertical(clip, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT):
     original_ratio = original_w / original_h
 
     if original_ratio > target_ratio:
-        # ── 横長動画の場合: 左右をカットする ──
-        # 高さをそのまま保ちつつ、幅を目標比率に合わせて計算
-        new_w = int(original_h * target_ratio)
-        # x_center / y_center で「どこを中心に切り抜くか」を指定
-        clipped = clip.crop(
-            x_center=original_w / 2,  # 水平方向は真ん中
-            y_center=original_h / 2,  # 垂直方向も真ん中
-            width=new_w,
-            height=original_h,
+        # ── 横長動画の場合: 高さに合わせてスケール → 左右をクロップ ──
+        # resize(height=...) で高さ基準にスケールし、幅を後からクロップ
+        scaled = clip.resize(height=height)
+        return scaled.crop(
+            x_center=scaled.w / 2,
+            y_center=height / 2,
+            width=width,
+            height=height,
         )
     else:
-        # ── 縦長・正方形動画の場合: 上下をカットする ──
-        new_h = int(original_w / target_ratio)
-        clipped = clip.crop(
-            x_center=original_w / 2,
-            y_center=original_h / 2,
-            width=original_w,
-            height=new_h,
+        # ── 縦長・正方形動画の場合: 幅に合わせてスケール → 上下をクロップ ──
+        scaled = clip.resize(width=width)
+        return scaled.crop(
+            x_center=width / 2,
+            y_center=scaled.h / 2,
+            width=width,
+            height=height,
         )
-
-    # 最終的に目標解像度 (1080×1920) にリサイズして返す
-    return clipped.resize((width, height))
 
 
 def analyze_video(video_path):
