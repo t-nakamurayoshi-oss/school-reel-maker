@@ -19,9 +19,10 @@ make_reel.py
     - 選んだシーンをつなぎ合わせて reel.mp4 を出力する
 """
 
-import os       # ファイルパス操作に使う標準ライブラリ
-import sys      # スクリプト終了 (sys.exit) に使う標準ライブラリ
-import glob     # ワイルドカードでファイルを検索する標準ライブラリ
+import os         # ファイルパス操作に使う標準ライブラリ
+import sys        # スクリプト終了 (sys.exit) に使う標準ライブラリ
+import glob       # ワイルドカードでファイルを検索する標準ライブラリ
+import subprocess # ffmpeg を直接呼び出して音声を読み込むために使う
 
 import numpy as np                        # 音量計算の数値処理に使う
 from moviepy.editor import (
@@ -69,43 +70,55 @@ VIDEO_EXTENSIONS = ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.m4v"]
 # 関数定義エリア
 # ============================================================
 
-def get_audio_rms(clip):
+def get_audio_rms(video_path, start_time, end_time):
     """
-    動画クリップの音量 (RMS 値) を計算して返す関数。
+    ffmpeg を直接呼び出して指定区間の音量 (RMS 値) を計算して返す関数。
 
-    RMS (Root Mean Square: 二乗平均平方根) は音の大きさを表す指標で、
-    値が大きいほど音が大きい（＝盛り上がっている）シーンを意味します。
+    MoviePy の音声 API を使わず ffmpeg subprocess で生 PCM データを取得します。
+    これにより NumPy・Pillow のバージョン互換性の問題を回避します。
 
     引数:
-        clip: MoviePy の VideoFileClip またはサブクリップオブジェクト
+        video_path (str): 動画ファイルのパス
+        start_time (float): 区間の開始時間 (秒)
+        end_time   (float): 区間の終了時間 (秒)
 
     戻り値:
-        float: RMS 値。音声がない場合は 0.0 を返す。
+        float: RMS 値。音声がない / 読み込み失敗の場合は 0.0 を返す。
     """
-    # 音声トラックがない動画は音量 0 として扱う
-    if clip.audio is None:
-        return 0.0
-
     try:
-        # 音声データを NumPy 配列として取得する
-        # fps=22050 は「1 秒あたりのサンプル数」（CD 音質の半分程度）
-        # nchunks に合わせてチャンクをリストに収めてから vstack する
-        fps = 22050
-        audio = clip.audio
-        tt = np.arange(0, clip.audio.duration, 1.0 / fps)
-        chunks = [audio.get_frame(t) for t in tt]
-        audio_array = np.array(chunks)
+        duration = end_time - start_time
+        # ffmpeg で指定区間だけ音声を 32bit float モノラル PCM として標準出力へ出す
+        cmd = [
+            "ffmpeg",
+            "-ss", str(start_time),   # 開始時間（入力前に指定すると高速）
+            "-t",  str(duration),     # 読み取る長さ
+            "-i",  video_path,        # 入力ファイル
+            "-vn",                    # 映像トラックを無視
+            "-acodec", "pcm_f32le",  # 32bit float リトルエンディアン PCM
+            "-ar",  "22050",          # サンプルレート
+            "-ac",  "1",              # モノラル
+            "-f",   "f32le",          # フォーマット指定
+            "pipe:1",                 # 標準出力へ書き出す
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,  # stdout / stderr をキャプチャ
+            timeout=30,           # 30 秒でタイムアウト
+        )
 
-        # ステレオ（左右 2 チャンネル）の場合は平均を取ってモノラルにする
-        if audio_array.ndim == 2:
-            audio_array = audio_array.mean(axis=1)
+        if not result.stdout:
+            return 0.0
+
+        # バイト列を float32 の NumPy 配列に変換
+        audio = np.frombuffer(result.stdout, dtype=np.float32)
+        if len(audio) == 0:
+            return 0.0
 
         # RMS を計算: 各サンプルを二乗 → 平均 → 平方根
-        rms = np.sqrt(np.mean(audio_array ** 2))
-        return float(rms)
+        return float(np.sqrt(np.mean(audio ** 2)))
 
     except Exception as e:
-        # 音声の読み込みに失敗した場合（破損ファイルなど）
+        # ffmpeg が見つからない・タイムアウトなどの場合
         print(f"    [警告] 音声の読み込みに失敗しました: {e}")
         return 0.0
 
@@ -201,11 +214,8 @@ def analyze_video(video_path):
             if segment_duration < MIN_CLIP_DURATION:
                 break
 
-            # 区間を切り出す（subclip は元の video を参照するだけ。コピーはしない）
-            segment_clip = video.subclip(start_time, end_time)
-
-            # 音量を測定
-            rms = get_audio_rms(segment_clip)
+            # 音量を測定（ffmpeg を直接呼び出すのでサブクリップは不要）
+            rms = get_audio_rms(video_path, start_time, end_time)
 
             # 結果をリストに追加
             segments.append({
@@ -215,9 +225,6 @@ def analyze_video(video_path):
                 "duration": segment_duration,
                 "path":     video_path,
             })
-
-            # 参照を解放してメモリを節約
-            segment_clip.close()
 
             # 次のセグメントへ
             start_time += SEGMENT_LENGTH
