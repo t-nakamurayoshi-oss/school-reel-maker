@@ -168,7 +168,12 @@ def crop_to_vertical(clip, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT):
         return np.array(img_resized)
 
     # fl_image: クリップの全フレームに process_frame を適用する
-    return clip.fl_image(process_frame)
+    result = clip.fl_image(process_frame)
+    # fl_image はフレーム内容を変えるが size メタデータは更新しない。
+    # size が古いまま (例: 1920×1080) だと compose 時にキャンバスが横長になり
+    # 映像が横に引き伸ばされる。ここで正しい値に上書きする。
+    result.size = (width, height)
+    return result
 
 
 def analyze_video(video_path):
