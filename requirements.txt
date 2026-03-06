@@ -28,8 +28,8 @@ pyyaml>=6.0
 # 顔検出・笑顔検出・人物中心クロップに使うライブラリ
 # インストールすると score_engine.py の笑顔スコア・顔サイズスコアが有効になる
 # headless 版は GUI 不要でサーバー・CLI 環境向け（推奨）
-# インストール: pip install opencv-python-headless
-# opencv-python-headless>=4.5.0
+# extract_talking.py の実行にも必須
+opencv-python-headless>=4.5.0
 
 # 音声文字起こし（文脈スコア）に使うライブラリ
 # インストール後、presets/variants.yaml の use_whisper: true に変更して使う
